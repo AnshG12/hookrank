@@ -116,8 +116,9 @@ flowchart LR
 - **👤 Editor:** picks from the shortlist. HookRank never posts anything by itself.
 - **Cost:** about $0.20 and 2 minutes for a 50-episode show.
 
-**📐 The full design, with diagrams of every stage: [docs/architecture.md](docs/architecture.md)**
-**📒 Every decision and experiment: [docs/decisions.md](docs/decisions.md)**
+- 📐 **The full design, with diagrams of every stage:** [docs/architecture.md](docs/architecture.md)
+- ✅ **How we know the output is good, and where it fails:** [docs/quality.md](docs/quality.md)
+- 📒 **Every decision and experiment:** [docs/decisions.md](docs/decisions.md)
 
 ---
 
@@ -136,3 +137,5 @@ flowchart LR
 - **Provisional scoring:** the scoring weights are reasoned assumptions; no editor data exists yet to tune them.
 - **Imperfect clip check:** it sometimes misjudges an ending.
 - **One template:** only the studio's screenplay template is supported.
+
+The full quality review (real runs, before/after results, honest failures, and the quality ablation we didn't have time to run) is in **[docs/quality.md](docs/quality.md)**.
