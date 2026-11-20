@@ -18,7 +18,7 @@
 |---|---|---|
 | S1: label test (5 episodes, 2 model families) | Can models label events reliably? | 0 invented event IDs. Episode endings were found far above chance, and the models agreed on key moments above chance. But the models' own "strength" scores just restated their ranking order, so we dropped them. |
 | S4/S5: model choice (11 Nebius models) | Which model labels best? | The rule was fixed before seeing results. Reasoning models failed by running out of output tokens. Qwen3-235B won on finding endings (5/5) and rerun stability (0.96 hooks / 0.82 cliffhangers). |
-| S6: prompt revision | Do tighter label definitions help? | The crowded top improved (17% of candidates scoring 95+ fell to 3%). But 2 of the 5 criteria **failed**, so we did not claim success. |
+| S6: prompt revision | Do tighter label definitions help? | The crowded top improved (17% of candidates scoring 95+ fell to 3.2%). But 2 of the 5 criteria **failed**, so we did not claim success. |
 | S7: clip-check calibration (12 cuts) | Can an AI check a clip? | Asking "does this pass?" got a "yes" on 23 of 24 cuts, so it was useless. Asking it to *classify* the opening and ending, with code deciding, passed all 6 strong cuts and caught 3 of the 4 clearly weak ones. |
 | S8: label fix | Does a stricter definition of "physical action" help? | **No.** Its tag count rose from 191 to 255. We replaced it with rules enforced in code and a lower weight. |
 
@@ -26,7 +26,7 @@
 
 The clips were read in full by an AI reviewer (Claude), not by a human editor, so treat this as directional.
 
-| Measure | Version 1 | Version 2 | Final |
+| Measure | Version 1 (D12) | Version 2 (D13) | Final (D14) |
 |---|---|---|---|
 | Candidates scoring 95+ (a crowded top means the ranking can't separate promos) | 17% | 3.2% | 1.3% |
 | Top 10 opening on a routine movement | – | 2 | 0 |

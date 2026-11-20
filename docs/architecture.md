@@ -247,7 +247,7 @@ flowchart TD
 
 - **Why "classify, don't judge":** the verdict version passed nearly everything. The classify version passed all 6 strong test cuts and caught 3 of the 4 clearly weak ones (S7).
 - **A failed check doesn't hide the clip:** a failed opening or ending scales that score by 0.4, and the reason appears in the report.
-- **Budgets:** up to 40 checks in the web app and 80 on the command line, so the cost stays bounded.
+- **Budgets:** up to 40 checks in the web app. On the command line it's up to 80 for the shortlist, plus up to 3 tries per episode for the best-per-episode list (90 checks in the final run). Either way the cost stays bounded.
 - **Known weakness:** the checker sometimes treats a twist as a "resolution" and can judge near-identical cuts differently. See *Where it picks badly* in the solution doc.
 
 ---
@@ -329,10 +329,10 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Model calls | 3 per episode + up to 40–80 clip checks (240 in total) |
+| Model calls | 240: 150 story and label calls (3 per episode) + 90 clip checks |
 | Candidate cuts scored | 11,398, by code, at no model cost |
 | Time | ≈ 2 minutes (Nebius, parallel requests) |
-| Cost | ≈ $0.19–0.20 per 50-episode show |
+| Cost | ≈ $0.20 per 50-episode show |
 | Re-run of unchanged episodes | free (cached) |
 
 - **Cost grows with episodes, not with candidates.** About 100 new 50-episode shows a week would cost about $20.
