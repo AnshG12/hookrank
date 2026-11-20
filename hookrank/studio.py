@@ -5,9 +5,10 @@ directory, estimates and caps spend, reports progress, calls ``hookrank.run.run`
 entry point as ``python main.py run``) and prepares display rows. No Streamlit import, so it
 is unit-testable.
 
-Security model (docs/decisions.md D15):
-  * the Nebius key is read server-side from Streamlit secrets or environment variables and is
-    only ever used inside the existing model client; it is never returned to the UI;
+Security model (docs/decisions.md D15, D17):
+  * provider keys (Nebius, Anthropic, OpenAI, Gemini, ...) are read server-side from Streamlit secrets
+    or environment variables and only ever used inside the model client; never returned to the UI.
+    Which models run is also decided in secrets, never by visitors;
   * every run gets a fresh temp directory (inputs, cache, outputs, spend ledger), deleted when
     the run ends, so sessions never share files and nothing is kept after a run;
   * each run has its own spend ledger, so the per-run cap is exact even though hosted storage
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import logging
 import re
 import shutil
@@ -30,8 +32,8 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping
 
-from .budget import fetch_prices
-from .config import Settings, split_model
+from .budget import Price, resolve_prices, unpriced_models
+from .config import ROLE_VARIABLES, Settings, is_config_variable
 from .llm import CHARS_PER_TOKEN
 from .parsing import chronology_key, load_episodes
 from .promos.schemas import Promo
@@ -40,7 +42,8 @@ from .schemas import Episode, Event
 
 log = logging.getLogger("hookrank.studio")
 
-# Model roles chosen by experiments S4/S5/S7 (D11, D12, D14). Overridable through secrets.
+# Model roles chosen by experiments S4/S5/S7 (D11, D12, D14). Any role can point at another provider
+# through secrets, e.g. HOOKRANK_STORY_MODEL = "anthropic:claude-opus-5-5" (D17).
 STUDIO_DEFAULTS = {
     "HOOKRANK_STORY_MODEL": "nebius:openai/gpt-oss-120b",
     "HOOKRANK_ANNOTATOR_MODELS": "nebius:Qwen/Qwen3-235B-A22B-Instruct-2507,nebius:openai/gpt-oss-120b",
@@ -200,17 +203,59 @@ def preview(sources: list[tuple[str, str]], limits: Limits = Limits()) -> Previe
 # ---- settings, access and spend ----------------------------------------------------------------
 
 def studio_settings(secrets: Mapping[str, object], run_ledger: Path, run_budget_usd: float) -> Settings:
-    """Settings for one analysis: Nebius roles, the server-side key, and a per-run ledger and cap."""
-    get = lambda key, default="": str(secrets.get(key) or default)
-    base = Settings.from_env() if not get("NEBIUS_API_KEY") else Settings()
-    roles = {k: get(k, v) for k, v in STUDIO_DEFAULTS.items()}
-    return replace(base,
-                   nebius_api_key=get("NEBIUS_API_KEY", base.nebius_api_key),
-                   nebius_concurrency=int(get("NEBIUS_CONCURRENCY", base.nebius_concurrency)),
-                   story_model=roles["HOOKRANK_STORY_MODEL"],
-                   annotator_models=tuple(m.strip() for m in roles["HOOKRANK_ANNOTATOR_MODELS"].split(",") if m.strip()),
-                   verifier_model=roles["HOOKRANK_VERIFIER_MODEL"],
-                   budget_usd=run_budget_usd, spend_ledger=str(run_ledger))
+    """Settings for one analysis: models and keys from secrets (environment as a local fallback),
+    the tested all-Nebius roles by default, and a per-run ledger and cap.
+
+    In the app every provider counts as paid unless secrets list it in HOOKRANK_FREE_ENDPOINTS, so
+    the spending caps cover any model that is swapped in."""
+    values = {k: v for k, v in os.environ.items()
+              if is_config_variable(k) and k not in (*ROLE_VARIABLES, "HOOKRANK_FREE_ENDPOINTS")}
+    values.update({k: str(v) for k, v in secrets.items() if v not in (None, "")})
+    for key, default in STUDIO_DEFAULTS.items():
+        values.setdefault(key, default)
+    values.setdefault("HOOKRANK_FREE_ENDPOINTS", "")
+    settings = Settings.from_mapping(values, budget_usd=run_budget_usd, spend_ledger=str(run_ledger))
+    return _fallback_to_defaults(settings)
+
+
+def _usable(settings: Settings, ref: str) -> bool:
+    endpoint = settings.endpoint(settings.split_model(ref)[0])
+    return bool((endpoint.api_key or not endpoint.key_required) and endpoint.base_url)
+
+
+def _fallback_to_defaults(settings: Settings) -> Settings:
+    """Nebius stays the main provider: a role whose provider has no key in secrets falls back to its
+    default (Nebius) model, so another provider is used only when its key is actually configured.
+    Fallbacks are logged; the page caption always shows the models that will really run."""
+    default_annotators = STUDIO_DEFAULTS["HOOKRANK_ANNOTATOR_MODELS"].split(",")
+    story, verifier = settings.story_model, settings.verifier_model
+    if not _usable(settings, story):
+        story = STUDIO_DEFAULTS["HOOKRANK_STORY_MODEL"]
+    if not _usable(settings, verifier):
+        verifier = STUDIO_DEFAULTS["HOOKRANK_VERIFIER_MODEL"]
+    annotators = [ref if _usable(settings, ref) else default_annotators[min(i, len(default_annotators) - 1)]
+                  for i, ref in enumerate(settings.annotator_models)]
+    replaced = annotators != list(settings.annotator_models)
+    annotators = list(dict.fromkeys(annotators))
+    for default in default_annotators:            # a fallback must not collapse two annotators into one
+        if not replaced or len(annotators) >= len(settings.annotator_models):
+            break
+        if default not in annotators:
+            annotators.append(default)
+    changed = (story, tuple(annotators), verifier) != (settings.story_model, settings.annotator_models,
+                                                       settings.verifier_model)
+    if changed:
+        log.warning("some configured models have no provider key in secrets; using the Nebius defaults for those roles")
+    return replace(settings, story_model=story, annotator_models=tuple(annotators), verifier_model=verifier)
+
+
+def describe_models(settings: Settings) -> str:
+    """Human-readable model roles (no keys), e.g. for the page caption."""
+    def show(ref: str) -> str:
+        provider, model = settings.split_model(ref)
+        return f"{model} ({settings.endpoint(provider).label})"
+    return (f"Story: {show(settings.story_model)} · Labels: {', '.join(show(r) for r in settings.annotator_models)}"
+            f" · Clip check: {show(settings.verifier_model)}")
 
 
 class DailyBudget:
@@ -242,27 +287,32 @@ class Estimate:
     usd: float
 
 
-def estimate(episodes: list[Episode], settings: Settings, prices: dict | None = None) -> Estimate:
-    """Upper-bound-ish estimate of one run's model usage and cost, from script size and roles."""
-    refs = [settings.story_model, *settings.annotator_models]
-    per_episode_chars = [sum(len(e.content) + 40 for e in ep.events) + 3000 for ep in episodes]
-    prompt = sum(int(c / CHARS_PER_TOKEN) for c in per_episode_chars) * len(refs) + VERIFY_TOP * 3000
-    output = 2000 * len(episodes) * len(refs) + VERIFY_TOP * 700
+def estimate(episodes: list[Episode], settings: Settings, prices: dict[str, Price] | None = None) -> Estimate:
+    """Upper-bound-ish estimate of one run's model usage and cost, from script size and each role's price."""
+    prices = prices or {}
+    episode_prompt = sum(int((sum(len(e.content) + 40 for e in ep.events) + 3000) / CHARS_PER_TOKEN) for ep in episodes)
+    usage = [(ref, episode_prompt, 2000 * len(episodes)) for ref in (settings.story_model, *settings.annotator_models)]
+    usage.append((settings.verifier_model, VERIFY_TOP * 3000, VERIFY_TOP * 700))
     usd = 0.0
-    if prices:
-        models = [split_model(r)[1] for r in refs]
-        priced = [prices[m] for m in models if m in prices]
-        if priced:
-            avg_in = sum(p.prompt_per_token for p in priced) / len(priced)
-            avg_out = sum(p.completion_per_token for p in priced) / len(priced)
-            usd = prompt * avg_in + output * avg_out
-    return Estimate(calls=len(episodes) * len(refs) + VERIFY_TOP, prompt_tokens=prompt, output_tokens=output,
-                    usd=round(usd, 4))
+    for ref, prompt_tokens, output_tokens in usage:
+        provider, model = settings.split_model(ref)
+        if settings.endpoint(provider).paid and model in prices:
+            usd += prices[model].cost(prompt_tokens, output_tokens)
+    return Estimate(calls=len(episodes) * (1 + len(settings.annotator_models)) + VERIFY_TOP,
+                    prompt_tokens=sum(u[1] for u in usage), output_tokens=sum(u[2] for u in usage), usd=round(usd, 4))
 
 
-def nebius_prices(settings: Settings) -> dict:
-    endpoint = settings.endpoint("nebius")
-    return fetch_prices(endpoint.base_url, endpoint.api_key) if endpoint.api_key else {}
+def model_prices(settings: Settings) -> dict[str, Price]:
+    """Prices for the configured models (built-in Claude list, provider catalogues, HOOKRANK_PRICES)."""
+    return resolve_prices(settings)
+
+
+def check_pricing(settings: Settings, prices: dict[str, Price]) -> None:
+    """Refuse to start when a paid model has no price, instead of failing call by call mid-run."""
+    missing = unpriced_models(settings, prices)
+    if missing:
+        raise UploadError(f"No price is configured for {', '.join(missing)}. The app owner must add it to "
+                          "HOOKRANK_PRICES in the app's secrets.")
 
 
 # ---- progress ----------------------------------------------------------------------------------
@@ -320,7 +370,8 @@ def analyze(sources: list[tuple[str, str]], secrets: Mapping[str, object], run_b
         input_dir = write_inputs(sources, work)
         settings = studio_settings(secrets, work / "spend.sqlite3", run_budget_usd)
         if settings.missing_keys():
-            raise UploadError("The server is missing its Nebius configuration; contact the app owner.")
+            raise UploadError(f"The server is missing configuration for the selected models "
+                              f"({', '.join(settings.missing_keys())}); contact the app owner.")
         if on_settings:
             on_settings(settings)
         if progress:
@@ -394,3 +445,8 @@ def summary_rows(promos: list[Promo]) -> list[dict]:
 
 def parse_json_export(data: bytes) -> list[dict]:
     return json.loads(data.decode("utf-8"))
+
+
+def provider_labels(settings: Settings) -> list[str]:
+    """Names of the providers the configured models use (for the privacy notice)."""
+    return sorted({settings.endpoint(settings.split_model(r)[0]).label for r in settings.model_refs})

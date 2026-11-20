@@ -129,7 +129,7 @@ def test_missing_server_key_is_reported_without_details(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)                          # no local .env
     monkeypatch.delenv("NEBIUS_API_KEY", raising=False)
     sources = [("e.txt", SCRIPT.format(n=1))]
-    with pytest.raises(studio.UploadError, match="missing its Nebius configuration"):
+    with pytest.raises(studio.UploadError, match=r"missing configuration for the selected models \(NEBIUS_API_KEY\)"):
         studio.analyze(sources, {}, 0.5)
 
 
@@ -138,7 +138,7 @@ def test_missing_server_key_is_reported_without_details(monkeypatch, tmp_path):
 def _app(monkeypatch, tmp_path, secrets: dict):
     from streamlit.testing.v1 import AppTest
     monkeypatch.chdir(tmp_path)                          # the app must not pick up the developer's .env
-    for key in ("NEBIUS_API_KEY",):
+    for key in ("NEBIUS_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     at = AppTest.from_file(str(ROOT / "streamlit_app.py"), default_timeout=30)
     for k, v in secrets.items():
@@ -160,6 +160,16 @@ def test_app_is_open_without_sign_in_and_never_shows_the_key(monkeypatch, tmp_pa
     analyze = [b for b in at.button if b.label == "Analyze"]
     assert analyze and analyze[0].disabled                                   # enabled only after a valid upload
     assert FAKE_KEY not in _page_text(at) and not at.exception
+    assert "Nebius Token Factory" in _page_text(at)                          # the models in use are shown
+
+
+def test_page_shows_swapped_models_but_never_their_keys(monkeypatch, tmp_path):
+    claude_key = "sk-ant-test-0000"
+    at = _app(monkeypatch, tmp_path, {"NEBIUS_API_KEY": FAKE_KEY, "ANTHROPIC_API_KEY": claude_key,
+                                      "HOOKRANK_STORY_MODEL": "anthropic:claude-opus-5-5"}).run()
+    text = _page_text(at)
+    assert "claude-opus-5-5 (Anthropic (Claude))" in text and "Anthropic (Claude) and Nebius Token Factory" in text
+    assert claude_key not in text and FAKE_KEY not in text and not at.exception
 
 
 def test_rerendering_results_never_calls_the_pipeline(stub_models, monkeypatch, tmp_path):

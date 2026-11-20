@@ -720,3 +720,67 @@ In every run the progress counts matched the real calls, no temp workspaces rema
 
 **Verified.** The tests now include `test_app_is_open_without_sign_in_and_never_shows_the_key`: no password box, Analyze disabled until a valid upload, key absent from the page. 47 tests pass.
 
+## D17 — Swappable model providers, configured in secrets only · Decided (2026-11-20, user request)
+
+**Why.** The brief notes that stronger models may be connected through APIs the team provides, so swapping the model must be easy. The user also wants Nebius to stay the main provider, with other providers used only when their key is supplied, and only through secrets (never typed into the app).
+
+**Decision.**
+- **One table of providers** (`hookrank/config.py: PROVIDERS`): `nebius`, `anthropic`, `openai`, `gemini`, `groq`, `custom` (any OpenAI-compatible gateway).
+  - Each provider is configured by variables named after it: `<NAME>_API_KEY`, `_BASE_URL`, `_CONCURRENCY`, `_REQUEST_TOKEN_LIMIT`, `_MAX_OUTPUT_TOKENS`.
+  - Roles are `provider:model` references. Adding a provider means adding one row.
+- **Two wire protocols, one client.**
+  - OpenAI, Gemini, Nebius, Groq and gateways use Chat Completions over HTTP. Google provides an official OpenAI-compatible endpoint for Gemini.
+  - Claude uses its native Messages API through the official Anthropic SDK, not a compatibility shim.
+  - Both paths share the retry rules, pacing, truncation detection, caching and spending guard.
+  - Claude requests send no temperature (current models reject sampling parameters) and get server-side refusal fallbacks on the models that support them.
+  - A refusal is reported as a failed call.
+- **Model-agnostic parameter handling.** A 400 that names a parameter we sent (`temperature`, `reasoning_effort`, `response_format`, `max_completion_tokens`) is retried once without it, instead of hard-coding per-model rules.
+- **Nebius stays the default.** In the web app, a role whose provider has no key in secrets falls back to its Nebius default. A fallback never reduces two annotators to one, and it is logged. The page shows the models that will actually run.
+- **Spending guard covers every provider.**
+  - In the web app every provider is paid unless secrets list it in `HOOKRANK_FREE_ENDPOINTS`.
+  - Price sources, lowest to highest precedence: built-in Claude list prices (as of 2026-11-03), provider catalogues (Nebius), then `HOOKRANK_PRICES`.
+  - A paid model with no price is refused before the run starts, with a message naming the setting to add.
+  - The cost estimate prices each role separately.
+- **Breaking change for the command line.** `openai:` and unprefixed models now mean the real OpenAI API (it used to point at Groq), and the free-tier defaults now use the explicit `groq:` prefix (`GROQ_API_KEY`).
+  - Older `.env` files that keep the Groq key in `OPENAI_API_KEY` with `OPENAI_BASE_URL` pointing at Groq still work, and that endpoint stays free.
+
+**Verified.**
+- 61 tests pass, 14 of them new: routing for each provider; Nebius default and fallback; Claude through a stubbed SDK (billing, effort, fallbacks, truncation, refusal, retry on 529); GPT retried without temperature; Gemini request shape; price parsing and refusal; the page shows the models in use and no key.
+- Replaying the final 50-episode run from its cache with the new code gives the identical ranking (240/240 calls cached). The Nebius requests did not change.
+- Live runs on Episode 1 through the app's own code:
+  - default Nebius: $0.0105, 26 s, 4 promos;
+  - story model swapped to Gemini in secrets: $0.0175, 54 s, 3 promos, same #1 promo;
+  - Gemini without a price: refused before any call.
+
+**Not verified live:** Claude and GPT calls, because no Anthropic or OpenAI key is available here. Their request paths are covered by tests with stubbed responses, and a single `python main.py doctor` with a real key would confirm them.
+
+**Risks.**
+- Stronger models are much more expensive: a 50-episode run on a frontier model can cost several dollars, so the per-run cap must be raised in secrets.
+- Thinking models spend part of the output budget on reasoning. Truncated answers are already handled by splitting into smaller windows.
+- Built-in Claude prices can go stale; `HOOKRANK_PRICES` overrides them.
+- On a Claude refusal fallback, the call is priced at the configured model's rate.
+- Quality on other models is unmeasured: S4–S8 calibrated prompts and checks on gpt-oss and Qwen.
+
+## D18 — Any OpenAI-compatible API, added by configuration · Decided (2026-11-20, user request)
+
+**Why.** The user asked for the app to work with "mostly every API possible". Most LLM APIs now accept the OpenAI Chat Completions format, so a fixed list of providers is unnecessary.
+
+**Decision.**
+- **More built-in providers.** OpenRouter, Together, Fireworks, DeepSeek, Mistral, xAI, Cerebras, Hugging Face and a local Ollama join the D17 set.
+  - Each base URL was checked on 2026-11-20: `GET /models` answers 200, or 401/403 without a key.
+  - Perplexity was left out because it has no `/models` endpoint; it can still be added by name.
+- **Providers added by name.** Setting `<NAME>_BASE_URL` (plus `<NAME>_API_KEY`) makes `name:model` usable.
+  - A prefix only counts as a provider if it is built in or declared this way, so model IDs containing a colon stay intact.
+  - The web app reads every secret that matches the provider-variable pattern, not a fixed list.
+- **Other ways of sending the key.** `<NAME>_AUTH_HEADER` sends the key in a named header (Azure OpenAI uses `api-key`) instead of `Authorization: Bearer`.
+- **Local models.** A base URL on localhost needs no key and costs nothing.
+- **Automatic prices from OpenRouter.** Its public `/models` catalogue publishes per-token prices in the same format as Nebius, so one OpenRouter key gives about 470 models priced automatically.
+  - Entries with variable prices (negative values, such as `openrouter/auto`) are not trusted, so those models need a configured price.
+
+**Verified.**
+- 71 tests pass, 10 of them new: built-in routing, a provider added by name with a custom key header (checked on the actual HTTP request), colon model IDs, local keyless models, the OpenRouter catalogue, untrusted variable prices, and the app picking up a provider added by name from secrets without showing its key.
+- Live: a provider defined only by `MYGATEWAY_BASE_URL`/`_API_KEY` (pointing at Nebius) answered a real call, billed at the configured price ($0.000026).
+- Live: the OpenRouter catalogue returned 469 priced models.
+
+**Not supported directly:** APIs that use neither the OpenAI nor the Claude format and have no OpenAI-compatible endpoint (for example, request signing with AWS SigV4). These need a small adapter, or a gateway such as LiteLLM in front of them.
+

@@ -41,8 +41,8 @@ def test_end_to_end_run_with_stubbed_models(tmp_path: Path, monkeypatch):
     source.mkdir()
     for n in (1, 2):
         (source / f"episode-{n:03d}.txt").write_text(SCRIPT.format(n=n), encoding="utf-8")
-    settings = Settings(openai_api_key="test", story_model="story-m", annotator_models=("ann-a", "ann-b"),
-                        verifier_model="verify-m", spend_ledger=str(tmp_path / "ledger.sqlite3"))
+    settings = Settings.from_mapping({"OPENAI_API_KEY": "test"}, story_model="story-m", annotator_models=("ann-a", "ann-b"),
+                                     verifier_model="verify-m", spend_ledger=str(tmp_path / "ledger.sqlite3"))
     out = tmp_path / "out"
 
     outcome = run(source, out, "demo", settings, top_n=5, verify_top=3)

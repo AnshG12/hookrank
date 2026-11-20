@@ -120,11 +120,11 @@ def render_episode(episode) -> tuple[str, dict[str, object], int]:
 def call(settings: Settings, model: str, prompt: str, extra: dict) -> tuple[str, dict, float, str]:
     payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
                "temperature": 0.1, "response_format": {"type": "json_object"}, **extra}
-    headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
+    headers = {"Authorization": f"Bearer {settings.endpoint('openai').api_key}"}
     for attempt in range(6):
         started = time.time()
         try:
-            data = _post_json(f"{settings.openai_base_url}/chat/completions", payload, headers, timeout=180)
+            data = _post_json(f"{settings.endpoint('openai').base_url}/chat/completions", payload, headers, timeout=180)
             choice = data["choices"][0]
             return choice["message"]["content"], data.get("usage", {}), time.time() - started, choice.get("finish_reason", "")
         except ProviderError as exc:
@@ -186,7 +186,7 @@ def main() -> int:
     args = parser.parse_args()
     wanted = {int(x) for x in args.episodes.split(",")}
     settings = Settings.from_env()
-    if not settings.openai_api_key:
+    if not settings.endpoint('openai').api_key:
         print("OPENAI_API_KEY is not set (Groq key expected).")
         return 1
     out_dir = Path(args.out)

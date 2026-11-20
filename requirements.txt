@@ -1,3 +1,4 @@
 pydantic>=2.6,<3
 streamlit>=1.42,<2
+anthropic>=2.11,<3
 pytest>=8,<9

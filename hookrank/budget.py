@@ -1,8 +1,9 @@
 """Hard spending cap for paid endpoints (decision D10).
 
-* Prices come from the provider's own catalogue (``GET /models?verbose=true`` -> ``pricing``
-  per token, as Nebius Token Factory publishes it). A model with no published price is refused:
-  the guard fails closed rather than guessing.
+* Prices come from, in order of precedence: the ``HOOKRANK_PRICES`` setting (USD per million
+  tokens, any provider), the provider's own catalogue where one exists (Nebius Token Factory publishes
+  ``pricing`` at ``GET /models?verbose=true``), and the built-in list of Claude prices below. A paid
+  model with no price is refused: the guard fails closed rather than guessing.
 * Before every paid call the guard *reserves* the worst case (estimated prompt tokens x input price
   + the full output budget x output price). If spent + reserved + this call would exceed the cap,
   the call is refused with ``BudgetExceeded`` and never sent.
@@ -38,6 +39,62 @@ class Price:
         return prompt_tokens * self.prompt_per_token + completion_tokens * self.completion_per_token
 
 
+# Anthropic first-party list prices (USD per million tokens, input/output), as of 2026-11-03.
+# Override or extend with HOOKRANK_PRICES when they change.
+CLAUDE_PRICES_PER_MILLION = {
+    "claude-fable-5-2": (8.0, 40.0), "claude-fable-5-1": (10.0, 50.0), "claude-fable-5": (10.0, 50.0),
+    "claude-opus-5-5": (4.0, 20.0), "claude-opus-5": (5.0, 25.0), "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0), "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-5-5": (2.0, 10.0), "claude-sonnet-5": (2.0, 10.0), "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-5-5": (0.10, 0.50), "claude-haiku-4-5": (1.0, 5.0),
+}
+# Providers whose /models endpoint publishes per-token prices as {"pricing": {"prompt", "completion"}}.
+CATALOGUE_PROVIDERS = ("nebius", "openrouter")
+
+
+def per_million(prompt_usd: float, completion_usd: float) -> Price:
+    return Price(prompt_usd / 1e6, completion_usd / 1e6)
+
+
+def parse_prices(spec: str, providers=None) -> dict[str, Price]:
+    """Parse ``"model=in/out, model2=in/out"`` (USD per million tokens; ``provider:`` prefixes allowed).
+
+    Example: ``"gpt-5.5=1.25/10, gemini:gemini-3.5-flash-lite=0/0"``. Malformed entries raise, so a
+    typo can never silently leave a paid model unpriced or priced at zero.
+    """
+    from .config import PROVIDERS, split_model
+    providers = providers or PROVIDERS
+    prices = {}
+    for entry in (e.strip() for e in spec.replace(";", ",").split(",")):
+        if not entry:
+            continue
+        name, sep, value = entry.rpartition("=")
+        try:
+            prompt_usd, completion_usd = (float(x) for x in value.split("/"))
+            if not sep or not name.strip() or prompt_usd < 0 or completion_usd < 0:
+                raise ValueError
+        except ValueError:
+            raise ProviderError(f"HOOKRANK_PRICES entry {entry!r} is not 'model=input/output' (USD per million tokens).")
+        prices[split_model(name.strip(), providers)[1]] = per_million(prompt_usd, completion_usd)
+    return prices
+
+
+def resolve_prices(settings) -> dict[str, Price]:
+    """Prices for the configured models: built-in Claude list < provider catalogues < HOOKRANK_PRICES."""
+    prices = {model: per_million(*usd) for model, usd in CLAUDE_PRICES_PER_MILLION.items()}
+    for endpoint in settings.endpoints_in_use:
+        if endpoint.name in CATALOGUE_PROVIDERS and endpoint.paid and endpoint.api_key:
+            prices.update(fetch_prices(endpoint.base_url, endpoint.api_key))
+    prices.update(parse_prices(settings.prices, settings.provider_names))
+    return prices
+
+
+def unpriced_models(settings, prices: dict[str, "Price"]) -> list[str]:
+    """Configured paid models without a price (their calls would be refused)."""
+    return [ref for ref in settings.model_refs
+            if settings.endpoint(settings.split_model(ref)[0]).paid and settings.split_model(ref)[1] not in prices]
+
+
 def fetch_prices(base_url: str, api_key: str, timeout: int = 30) -> dict[str, Price]:
     """Per-token prices from an OpenAI-compatible catalogue that publishes ``pricing`` (Nebius)."""
     request = urllib.request.Request(f"{base_url}/models?verbose=true",
@@ -51,9 +108,11 @@ def fetch_prices(base_url: str, api_key: str, timeout: int = 30) -> dict[str, Pr
     for model in data.get("data", []):
         pricing = model.get("pricing") or {}
         try:
-            prices[model["id"]] = Price(float(pricing["prompt"]), float(pricing["completion"]))
+            price = Price(float(pricing["prompt"]), float(pricing["completion"]))
         except (KeyError, TypeError, ValueError):
             continue
+        if price.prompt_per_token >= 0 and price.completion_per_token >= 0:   # negative = variable price
+            prices[model["id"]] = price
     return prices
 
 
@@ -94,7 +153,9 @@ class BudgetGuard:
     def price(self, model: str) -> Price:
         price = self.prices.get(model)
         if price is None:
-            raise BudgetExceeded(f"No published price for {model}; refusing a paid call without a price.")
+            raise BudgetExceeded(f"No price known for {model}; refusing a paid call without a price. Add it to "
+                                 "HOOKRANK_PRICES as 'model=input/output' (USD per million tokens), or list its "
+                                 "provider in HOOKRANK_FREE_ENDPOINTS if it is a free tier.")
         return price
 
     def reserve(self, base_url: str, model: str, prompt_tokens_est: int, max_output_tokens: int) -> float:
@@ -148,10 +209,8 @@ class BudgetGuard:
 
 
 def build_guard(settings, run_label: str = "") -> BudgetGuard:
-    """Guard for the configured models. Prices are fetched only if a paid (Nebius) model is used."""
-    from .config import split_model   # local import keeps budget.py free of config at import time
-    nebius = settings.endpoint("nebius")
-    uses_paid = any(split_model(ref)[0] == "nebius" for ref in settings.model_refs)
-    prices = fetch_prices(nebius.base_url, nebius.api_key) if uses_paid and nebius.api_key else {}
-    return BudgetGuard(settings.budget_usd, prices, Path(settings.spend_ledger), paid_base_urls=(nebius.base_url,),
-                       run_label=run_label)
+    """Guard for the configured models: every provider not declared free is paid and must be priced."""
+    from .config import PROVIDERS
+    paid = tuple(dict.fromkeys(e.base_url for e in (settings.endpoint(n) for n in PROVIDERS) if e.paid and e.base_url))
+    return BudgetGuard(settings.budget_usd, resolve_prices(settings), Path(settings.spend_ledger),
+                       paid_base_urls=paid, run_label=run_label)

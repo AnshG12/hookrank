@@ -80,11 +80,16 @@ def test_model_references_route_to_their_endpoints():
     assert split_model("openai/gpt-oss-120b") == ("openai", "openai/gpt-oss-120b")
     assert split_model("qwen2.5:3b") == ("openai", "qwen2.5:3b")            # colon inside a model ID
     assert split_model("nebius:openai/gpt-oss-120b") == ("nebius", "openai/gpt-oss-120b")
-    s = Settings(openai_api_key="g", gemini_api_key="k")
-    gem, groq = spec_for("gemini:gemini-3.5-flash-lite", s), spec_for("openai/gpt-oss-120b", s)
+    assert split_model("anthropic:claude-opus-5-5") == ("anthropic", "claude-opus-5-5")
+    s = Settings.from_mapping({"GROQ_API_KEY": "g", "GEMINI_API_KEY": "k"})
+    gem, groq = spec_for("gemini:gemini-3.5-flash-lite", s), spec_for("groq:openai/gpt-oss-120b", s)
     assert gem.model == "gemini-3.5-flash-lite" and "generativelanguage" in gem.base_url and gem.api_key == "k"
     assert gem.request_token_limit == 32000 and groq.request_token_limit == 8000 and groq.api_key == "g"
-    assert Settings(openai_api_key="g").missing_keys() == ["GEMINI_API_KEY"]   # default story model is on Gemini
+    assert s.missing_keys() == []                                            # CLI defaults: Gemini + Groq
+    assert Settings.from_mapping({"GROQ_API_KEY": "g"}).missing_keys() == ["GEMINI_API_KEY"]
+    # older .env files: Groq key under OPENAI_* with OPENAI_BASE_URL pointing at Groq still works, and stays free
+    legacy = Settings.from_mapping({"OPENAI_BASE_URL": "https://api.groq.com/openai/v1", "OPENAI_API_KEY": "old"})
+    assert legacy.endpoint("groq").api_key == "old" and not legacy.endpoint("openai").paid
 
 
 def test_budget_guard_refuses_calls_that_could_break_the_cap(tmp_path, monkeypatch):

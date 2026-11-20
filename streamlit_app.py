@@ -1,7 +1,8 @@
 """HookRank - single-page Streamlit app: upload -> analyze -> review -> download.
 
-All AI work is done by the existing pipeline through hookrank/studio.py. The Nebius key lives in
-Streamlit secrets (or environment variables locally) and is used only on the server. The app is open
+All AI work is done by the existing pipeline through hookrank/studio.py. Which models run, and the
+provider keys they need, live in Streamlit secrets (or environment variables locally) and are used
+only on the server (D17): visitors can never choose a model or enter a key. The app is open
 to anyone with the link (no sign-in, D16): spend is bounded by the per-run cap, the app-wide daily
 cap, one analysis at a time and the upload limits.
 """
@@ -17,16 +18,12 @@ import time
 import streamlit as st
 
 from hookrank import studio
-from hookrank.config import load_dotenv
+from hookrank.config import is_config_variable, load_dotenv
 from hookrank.providers import ProviderError
 
 st.set_page_config(page_title="HookRank", page_icon="🎬", layout="centered")
 load_dotenv()            # local development only; on Streamlit Community Cloud, secrets are used
 log = logging.getLogger("hookrank.app")
-
-CONFIG_KEYS = ("NEBIUS_API_KEY", "NEBIUS_CONCURRENCY", "HOOKRANK_STORY_MODEL", "HOOKRANK_ANNOTATOR_MODELS",
-               "HOOKRANK_VERIFIER_MODEL")
-
 
 def secret(key: str, default: str = "") -> str:
     try:
@@ -48,17 +45,15 @@ def shared() -> dict:
             "daily": studio.DailyBudget(float(secret("HOOKRANK_APP_DAILY_BUDGET_USD", "3.00")))}
 
 
-@st.cache_resource(ttl=3600)
-def cached_prices() -> dict:
-    """Public per-token prices from the Nebius catalogue (not user data)."""
-    try:
-        return studio.nebius_prices(studio.studio_settings(model_config(), studio.Path("/dev/null"), RUN_BUDGET))
-    except ProviderError:
-        return {}
-
-
 def model_config() -> dict:
-    return {k: v for k in CONFIG_KEYS if (v := secret(k))}
+    """Model roles, provider keys and prices from secrets (environment as a local fallback).
+    Never shown to visitors. Any provider can be added by name with <NAME>_BASE_URL / <NAME>_API_KEY."""
+    try:
+        names = [k for k in st.secrets.keys() if is_config_variable(k)]
+    except Exception:            # no secrets file (local runs fall back to environment variables)
+        names = []
+    names += [k for k in os.environ if is_config_variable(k)]
+    return {k: v for k in dict.fromkeys(names) if (v := secret(k))}
 
 
 CSS = """
@@ -107,7 +102,20 @@ def run_analysis() -> None:
     try:
         cfg = model_config()
         settings = studio.studio_settings(cfg, studio.Path("/dev/null"), RUN_BUDGET)
-        est = studio.estimate([e for e in studio.preview(sources, LIMITS).usable], settings, cached_prices())
+        if settings.missing_keys():
+            st.error(f"The server is missing configuration for the selected models "
+                     f"({', '.join(settings.missing_keys())}). Please contact the app owner.")
+            return
+        try:
+            prices = studio.model_prices(settings)
+            studio.check_pricing(settings, prices)
+        except studio.UploadError as exc:
+            st.error(str(exc))
+            return
+        except ProviderError:
+            st.error("Could not load model prices from the provider. Please try again in a minute.")
+            return
+        est = studio.estimate([e for e in studio.preview(sources, LIMITS).usable], settings, prices)
         if est.usd > RUN_BUDGET:
             st.error(f"This upload would need about ${est.usd:.2f}, above the ${RUN_BUDGET:.2f} limit per analysis. "
                      "Upload fewer episodes.")
@@ -208,8 +216,10 @@ def show_results(a) -> None:
 
 st.title("HookRank")
 st.markdown("*AI-powered promo discovery for microdramas.*")
-st.caption("Uploaded screenplays are sent to Nebius Token Factory for analysis, processed in a temporary "
+_settings = studio.studio_settings(model_config(), studio.Path("/dev/null"), RUN_BUDGET)
+st.caption(f"Uploaded screenplays are sent to {' and '.join(studio.provider_labels(_settings))} for analysis, processed in a temporary "
            "workspace that is deleted when the analysis ends, and kept only in your browser session.")
+st.caption(studio.describe_models(_settings))
 
 files = st.file_uploader("Upload a ZIP of episodes or .txt screenplay files", type=["zip", "txt"],
                          accept_multiple_files=True)

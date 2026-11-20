@@ -1,4 +1,4 @@
-"""Chat client for OpenAI-compatible endpoints, built for free-tier reality.
+"""Chat client for every configured provider: OpenAI-compatible endpoints and Claude.
 
 Why this exists alongside ``providers.py``: the narrative engine needs things the simple
 ``complete(prompt) -> str`` interface cannot give it (see docs/decisions.md S1/D4):
@@ -9,6 +9,10 @@ Why this exists alongside ``providers.py``: the narrative engine needs things th
 * rate-limit pacing from response headers (Groq free tier: 8k tokens/min per model),
 * a request budget that keeps prompt + output under the per-request token ceiling
   (requests above it are rejected outright with HTTP 413).
+
+OpenAI-compatible providers (OpenAI, Gemini, Nebius, Groq, gateways) are called over plain HTTP;
+Claude is called through the official Anthropic SDK (Messages API). Both paths share the same retry
+rules, pacing, truncation detection and spending guard, so a model swap changes nothing downstream.
 """
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from .budget import BudgetGuard
-from .config import Settings, split_model
+from .config import ANTHROPIC_MESSAGES, CHAT_COMPLETIONS, Settings
 from .providers import USER_AGENT, ProviderError
 
 log = logging.getLogger("hookrank.llm")
@@ -40,6 +44,21 @@ class TruncatedResponse(ProviderError):
     """The model stopped because it ran out of output budget; its answer is incomplete."""
 
 
+class HTTPFailure(Exception):
+    """A provider answered with an HTTP error; the same retry rules apply whichever provider it was."""
+
+    def __init__(self, code: int, body: str, headers) -> None:
+        super().__init__(f"HTTP {code}")
+        self.code, self.body, self.headers = code, body, headers
+
+
+# Request parameters a provider may reject for some models (e.g. reasoning models refuse a custom
+# temperature). They are dropped and the request retried once, instead of hard-coding model lists.
+OPTIONAL_PARAMS = ("temperature", "reasoning_effort")
+# Claude models that accept server-side refusal fallbacks (beta); see ChatClient._post_anthropic.
+FALLBACK_MODEL_PREFIXES = ("claude-fable-5", "claude-mythos-5", "claude-opus-5", "claude-sonnet-5-5")
+
+
 def estimate_tokens(text: str) -> int:
     return int(len(text) / CHARS_PER_TOKEN) + 1
 
@@ -55,6 +74,9 @@ class ModelSpec:
     request_token_limit: int = 8000   # per-request ceiling (prompt + max output)
     max_output_tokens: int = 3000
     concurrency: int = 1              # parallel requests allowed for this model
+    api: str = CHAT_COMPLETIONS       # wire protocol (config.CHAT_COMPLETIONS or config.ANTHROPIC_MESSAGES)
+    auth_header: str = "bearer"       # "bearer" -> Authorization: Bearer <key>; otherwise that header carries the key
+    key_required: bool = True         # False for models served locally (e.g. Ollama)
 
     @property
     def short_name(self) -> str:
@@ -64,8 +86,11 @@ class ModelSpec:
         return dict(self.params)
 
 
-def default_params(model: str) -> tuple[tuple[str, object], ...]:
+def default_params(model: str, settings: Settings | None = None, api: str = CHAT_COMPLETIONS) -> tuple[tuple[str, object], ...]:
     """Model-family request parameters, made explicit (never rely on provider defaults)."""
+    if api == ANTHROPIC_MESSAGES:
+        effort = settings.anthropic_effort if settings else ""
+        return (("effort", effort),) if effort else ()
     if "gpt-oss" in model:
         # Low effort: medium needs ~4-6k reasoning tokens, which cannot fit an 8k
         # free-tier request together with an episode prompt (S1).
@@ -74,12 +99,13 @@ def default_params(model: str) -> tuple[tuple[str, object], ...]:
 
 
 def spec_for(ref: str, settings: Settings) -> ModelSpec:
-    """ModelSpec for an ``[endpoint:]model`` reference (see config.split_model)."""
-    endpoint = settings.endpoint(split_model(ref)[0])
-    model = split_model(ref)[1]
+    """ModelSpec for a ``provider:model`` reference (see config.split_model)."""
+    provider, model = settings.split_model(ref)
+    endpoint = settings.endpoint(provider)
     return ModelSpec(model=model, base_url=endpoint.base_url, api_key=endpoint.api_key,
-                     params=default_params(model), request_token_limit=endpoint.request_token_limit,
-                     max_output_tokens=endpoint.max_output_tokens, concurrency=endpoint.concurrency)
+                     params=default_params(model, settings, endpoint.api), request_token_limit=endpoint.request_token_limit,
+                     max_output_tokens=endpoint.max_output_tokens, concurrency=endpoint.concurrency, api=endpoint.api,
+                     auth_header=endpoint.auth_header, key_required=endpoint.key_required)
 
 
 @dataclass
@@ -180,13 +206,15 @@ class ChatClient:
 
     def __init__(self, spec: ModelSpec, limiter: RateLimiter | None = None, max_attempts: int = 8,
                  timeout_s: int = 180, budget: BudgetGuard | None = None) -> None:
-        if not spec.api_key:
+        if spec.key_required and not spec.api_key:
             raise ProviderError(f"No API key configured for {spec.model}.")
         self.spec = spec
         self.limiter = limiter or RateLimiter()
         self.budget = budget
         self.max_attempts = max_attempts
         self.timeout_s = timeout_s
+        self._anthropic = None
+        self._fallbacks = spec.api == ANTHROPIC_MESSAGES and spec.model.startswith(FALLBACK_MODEL_PREFIXES)
 
     def output_budget(self, prompt: str) -> int:
         """Largest output budget that keeps the request under the per-request ceiling."""
@@ -226,8 +254,8 @@ class ChatClient:
             waited += self.limiter.wait_for(estimate_tokens(prompt) + budget)
             try:
                 data, headers = self._post(payload)
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")[:1000]
+            except HTTPFailure as exc:
+                body = exc.body
                 if exc.headers:
                     self.limiter.update(exc.headers)
                 self.limiter.learn_output_limit(body)
@@ -239,9 +267,22 @@ class ChatClient:
                     log.info("%s rejected JSON mode; retrying without response_format", self.spec.short_name)
                     payload.pop("response_format")
                     continue
+                rejected = [p for p in OPTIONAL_PARAMS if p in payload and p in body] if exc.code == 400 else []
+                if rejected:
+                    log.info("%s rejected %s; retrying without it", self.spec.short_name, ", ".join(rejected))
+                    for name in rejected:
+                        payload.pop(name)
+                    continue
+                if exc.code == 400 and "max_completion_tokens" in payload and "max_completion_tokens" in body:
+                    payload["max_tokens"] = payload.pop("max_completion_tokens")   # older OpenAI-compatible gateways
+                    continue
+                if exc.code == 400 and self._fallbacks and "fallback" in body.lower():
+                    log.info("%s: refusal fallbacks unavailable; retrying without them", self.spec.short_name)
+                    self._fallbacks = False
+                    continue
                 # Server-side JSON validation failures are non-deterministic; one retry is cheap.
                 json_retry = exc.code == 400 and "json_validate_failed" in body and attempt == 1
-                if (exc.code in (429, 500, 502, 503, 504) or json_retry) and attempt < self.max_attempts:
+                if (exc.code in (429, 500, 502, 503, 504, 529) or json_retry) and attempt < self.max_attempts:
                     delay = _retry_delay(exc, body, attempt) + 0.5
                     log.info("%s HTTP %s; retrying in %.1fs (attempt %d)", self.spec.short_name, exc.code, delay, attempt)
                     if delay > 120:  # far beyond a per-minute window: record why (e.g. a daily quota, R4)
@@ -266,6 +307,8 @@ class ChatClient:
                 raise ProviderError(f"Unexpected response shape from {self.spec.model}.") from exc
             finish = choice.get("finish_reason") or ""
             self._settle(reservation, data.get("usage") or {}, call)   # billed even if truncated
+            if finish == "refusal":
+                raise ProviderError(f"{self.spec.model} declined this request (refusal stop reason).")
             if finish == "length":
                 raise TruncatedResponse(f"{self.spec.model} hit its {budget}-token output budget; answer is incomplete.")
             return ChatResult(text=text, model=self.spec.model, usage=data.get("usage") or {}, finish_reason=finish,
@@ -274,13 +317,58 @@ class ChatClient:
         raise ProviderError(f"{self.spec.model}: request failed after {self.max_attempts} attempts.")
 
     def _post(self, payload: dict) -> tuple[dict, dict]:
-        request = urllib.request.Request(
-            f"{self.spec.base_url}/chat/completions", data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT,
-                     "Authorization": f"Bearer {self.spec.api_key}"})
-        with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-            headers = {k.lower(): v for k, v in response.headers.items()}
-            try:
-                return json.loads(response.read().decode("utf-8")), headers
-            except json.JSONDecodeError as exc:
-                raise ProviderError(f"{self.spec.model} returned a non-JSON HTTP body.") from exc
+        """Send one request; return an OpenAI-shaped response body (choices, usage) and the headers."""
+        if self.spec.api == ANTHROPIC_MESSAGES:
+            return self._post_anthropic(payload)
+        headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
+        if self.spec.api_key:
+            if self.spec.auth_header.lower() in ("bearer", "authorization"):
+                headers["Authorization"] = f"Bearer {self.spec.api_key}"
+            else:                                     # e.g. Azure OpenAI's "api-key" header
+                headers[self.spec.auth_header] = self.spec.api_key
+        request = urllib.request.Request(f"{self.spec.base_url}/chat/completions",
+                                         data=json.dumps(payload).encode("utf-8"), headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+                headers = {k.lower(): v for k, v in response.headers.items()}
+                try:
+                    return json.loads(response.read().decode("utf-8")), headers
+                except json.JSONDecodeError as exc:
+                    raise ProviderError(f"{self.spec.model} returned a non-JSON HTTP body.") from exc
+        except urllib.error.HTTPError as exc:
+            raise HTTPFailure(exc.code, exc.read().decode("utf-8", errors="replace")[:1000], exc.headers) from exc
+
+    def _post_anthropic(self, payload: dict) -> tuple[dict, dict]:
+        """One Claude Messages API call through the official SDK, normalised to the OpenAI shape.
+
+        Temperature and JSON mode are not sent (current Claude models reject sampling parameters;
+        the prompts ask for JSON and Python validates it). The SDK's own retries are off so the
+        shared retry, pacing and budget logic above applies unchanged.
+        """
+        import anthropic   # imported here so OpenAI-compatible setups do not need the package
+
+        if self._anthropic is None:
+            self._anthropic = anthropic.Anthropic(api_key=self.spec.api_key, base_url=self.spec.base_url,
+                                                  max_retries=0, timeout=float(self.timeout_s))
+        kwargs: dict = {"model": self.spec.model, "messages": payload["messages"],
+                        "max_tokens": payload.get("max_completion_tokens") or payload.get("max_tokens")}
+        if payload.get("effort"):
+            kwargs["output_config"] = {"effort": payload["effort"]}
+        try:
+            if self._fallbacks:   # on a policy refusal the API re-runs the request on a suitable model
+                message = self._anthropic.beta.messages.create(betas=["server-side-fallback-2026-07-01"],
+                                                               fallbacks="default", **kwargs)
+            else:
+                message = self._anthropic.messages.create(**kwargs)
+        except anthropic.APIStatusError as exc:
+            raise HTTPFailure(exc.status_code, (exc.response.text or str(exc.message))[:1000], exc.response.headers) from exc
+        except anthropic.APIConnectionError as exc:   # includes timeouts
+            raise urllib.error.URLError(str(exc)) from exc
+        text = "".join(block.text for block in message.content if block.type == "text")
+        finish = {"end_turn": "stop", "stop_sequence": "stop", "max_tokens": "length"}.get(
+            message.stop_reason or "", message.stop_reason or "")
+        usage = message.usage
+        prompt_tokens = (usage.input_tokens + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+                         + (getattr(usage, "cache_read_input_tokens", 0) or 0))
+        return ({"choices": [{"message": {"content": text}, "finish_reason": finish}], "model": message.model,
+                 "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": usage.output_tokens}}, {})

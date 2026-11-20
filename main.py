@@ -11,7 +11,7 @@ from pathlib import Path
 
 from hookrank.budget import build_guard
 from hookrank.cache import CallCache
-from hookrank.config import Settings
+from hookrank.config import PROVIDERS, Settings
 from hookrank.llm import ChatClient, spec_for
 from hookrank.narrative import NarrativeEngine
 from hookrank.parsing import chronology_key, load_episodes
@@ -43,23 +43,26 @@ def write_env(values: dict[str, str]) -> None:
 
 
 def configure() -> None:
-    """Set endpoints, API keys and model roles. Models are [endpoint:]model references."""
+    """Set provider keys and model roles. Models are provider:model references (see hookrank/config.py)."""
     settings = Settings.from_env()
     banner()
     console.print("\n[bold]Configure the narrative engine[/]")
-    console.print("[dim]Default endpoint (Groq): annotators. Gemini endpoint: story model (prefix 'gemini:').[/]")
-    values = {"OPENAI_BASE_URL": Prompt.ask("Default endpoint URL", default=settings.openai_base_url)}
-    for variable, label, current in (("OPENAI_API_KEY", "Default endpoint API key", settings.openai_api_key),
-                                     ("GEMINI_API_KEY", "Gemini API key", settings.gemini_api_key),
-                                     ("NEBIUS_API_KEY", "Nebius Token Factory API key", settings.nebius_api_key)):
-        key = getpass.getpass(f"{label} (input hidden; blank keeps current): ")
+    console.print("[dim]Models are written as provider:model, e.g. anthropic:claude-opus-5-5, openai:gpt-5.5, "
+                  "gemini:gemini-3.5-flash-lite, nebius:openai/gpt-oss-120b. Leave a key blank to keep it.[/]")
+    values = {}
+    for name, provider in PROVIDERS.items():
+        endpoint = settings.endpoint(name)
+        if name == "custom":
+            url = Prompt.ask("OpenAI-compatible gateway URL (optional)", default=endpoint.base_url or "")
+            if url:
+                values["CUSTOM_BASE_URL"] = url
+        key = getpass.getpass(f"{provider.label} API key, {endpoint.key_variable} (input hidden; blank keeps current): ")
         if key:
-            values[variable] = key
-        elif not current:
-            info(f"No {variable} entered; models on that endpoint will not work until it is set.")
+            values[endpoint.key_variable] = key
     values["HOOKRANK_STORY_MODEL"] = Prompt.ask("Story model", default=settings.story_model)
     values["HOOKRANK_ANNOTATOR_MODELS"] = Prompt.ask("Annotator models (comma-separated, ideally two families)",
                                                      default=",".join(settings.annotator_models))
+    values["HOOKRANK_VERIFIER_MODEL"] = Prompt.ask("Clip-check model", default=settings.verifier_model)
     write_env(values)
     success("Saved configuration in .env (file permissions restricted where supported). Run `python main.py doctor`.")
 
