@@ -1,0 +1,13 @@
+[server]
+maxUploadSize = 25            # MB; the app also enforces its own upload limits (hookrank/studio.py)
+
+[client]
+showErrorDetails = "none"     # never send stack traces to the browser
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#4f46e5"
